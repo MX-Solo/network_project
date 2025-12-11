@@ -1,0 +1,85 @@
+version: '3.8'
+
+services:
+  # Redis service for STUN server
+  redis:
+    image: redis:7-alpine
+    container_name: p2p-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - p2p-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # STUN Server
+  stun-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.stun
+    container_name: p2p-stun-server
+    ports:
+      - "5000:5000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - p2p-network
+    restart: unless-stopped
+
+  # Peer 1 (Example)
+  peer1:
+    build:
+      context: .
+      dockerfile: Dockerfile.peer
+    container_name: p2p-peer1
+    ports:
+      - "8888:8888"
+    environment:
+      - STUN_SERVER_URL=http://stun-server:5000
+      - PEER_USERNAME=peer1
+      - PEER_PORT=8888
+    depends_on:
+      - stun-server
+    networks:
+      - p2p-network
+    # For GUI, you may need X11 forwarding
+    # For testing, you can run without GUI
+    stdin_open: true
+    tty: true
+
+  # Peer 2 (Example)
+  peer2:
+    build:
+      context: .
+      dockerfile: Dockerfile.peer
+    container_name: p2p-peer2
+    ports:
+      - "8889:8888"
+    environment:
+      - STUN_SERVER_URL=http://stun-server:5000
+      - PEER_USERNAME=peer2
+      - PEER_PORT=8888
+    depends_on:
+      - stun-server
+    networks:
+      - p2p-network
+    stdin_open: true
+    tty: true
+
+volumes:
+  redis_data:
+
+networks:
+  p2p-network:
+    driver: bridge
+

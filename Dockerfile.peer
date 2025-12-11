@@ -1,0 +1,23 @@
+# Dockerfile for Peer Client
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy peer code
+COPY peer.py .
+COPY peer_gui.py .
+
+# Note: GUI requires X11 forwarding for Docker
+# For headless testing, you can use a CLI version
+# For now, we'll keep GUI support
+
+# Expose TCP port (will be mapped at runtime)
+EXPOSE 8888
+
+# Default command (can be overridden)
+CMD ["python", "peer_gui.py"]
+
