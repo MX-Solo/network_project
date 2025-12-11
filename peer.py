@@ -41,6 +41,7 @@ class Peer:
         self.is_running = False
         self.message_callback = None
         self.file_callback = None
+        self.connection_callback = None  # Callback for connection events
         self.server_thread = None
         self.receive_threads = {}
         
@@ -51,6 +52,10 @@ class Peer:
     def set_file_callback(self, callback):
         """Set callback function for file transfer events"""
         self.file_callback = callback
+    
+    def set_connection_callback(self, callback):
+        """Set callback function for connection events (connect/disconnect)"""
+        self.connection_callback = callback
     
     def start_server(self):
         """Start TCP server to accept incoming connections"""
@@ -91,6 +96,9 @@ class Peer:
     def _handle_connection(self, client_socket, address):
         """Handle a single connection"""
         try:
+            # Set timeout for initial handshake
+            client_socket.settimeout(5)
+            
             # First message should be a connection request with username
             message = self._receive_message(client_socket)
             
@@ -108,12 +116,28 @@ class Peer:
                 # Store connection
                 self.connections[peer_username] = client_socket
                 
-                if self.message_callback:
+                # Remove timeout for receive loop
+                client_socket.settimeout(None)
+                
+                # Notify about connection
+                if self.connection_callback:
+                    self.connection_callback('connected', peer_username)
+                elif self.message_callback:
                     self.message_callback(f"System: {peer_username} connected", "system")
                 
-                # Start receiving messages from this peer
-                self._receive_loop(client_socket, peer_username)
+                # Start receiving messages from this peer in a separate thread
+                receive_thread = threading.Thread(
+                    target=self._receive_loop,
+                    args=(client_socket, peer_username),
+                    daemon=True
+                )
+                receive_thread.start()
+                self.receive_threads[peer_username] = receive_thread
             else:
+                client_socket.close()
+        except socket.timeout:
+            print(f"✗ Connection timeout from {address}")
+            if client_socket:
                 client_socket.close()
         except Exception as e:
             print(f"✗ Error handling connection: {e}")
@@ -131,6 +155,9 @@ class Peer:
             sock.settimeout(5)
             sock.connect((peer_ip, peer_port))
             
+            # Remove timeout after connection
+            sock.settimeout(None)
+            
             # Send connection request
             request = {
                 'type': MessageType.CONNECTION_REQUEST.value,
@@ -139,17 +166,28 @@ class Peer:
             }
             self._send_message(sock, request)
             
-            # Wait for response
+            # Wait for response with timeout
+            sock.settimeout(5)
             response = self._receive_message(sock)
+            sock.settimeout(None)  # Remove timeout for receive loop
             
             if response and response.get('type') == MessageType.CONNECTION_ACCEPT.value:
                 self.connections[peer_username] = sock
                 
-                if self.message_callback:
+                # Notify about connection
+                if self.connection_callback:
+                    self.connection_callback('connected', peer_username)
+                elif self.message_callback:
                     self.message_callback(f"System: Connected to {peer_username}", "system")
                 
-                # Start receiving messages
-                self._receive_loop(sock, peer_username)
+                # Start receiving messages in a separate thread
+                receive_thread = threading.Thread(
+                    target=self._receive_loop,
+                    args=(sock, peer_username),
+                    daemon=True
+                )
+                receive_thread.start()
+                self.receive_threads[peer_username] = receive_thread
                 return True
             else:
                 sock.close()
@@ -168,6 +206,9 @@ class Peer:
     
     def _receive_loop(self, sock, peer_username):
         """Continuously receive messages from a peer"""
+        # Remove timeout for blocking receive
+        sock.settimeout(None)
+        
         while self.is_running:
             try:
                 message = self._receive_message(sock)
@@ -193,12 +234,25 @@ class Peer:
                         self.file_callback('data', peer_username, message)
                 
                 elif msg_type == MessageType.DISCONNECT.value:
-                    if self.message_callback:
+                    if self.connection_callback:
+                        self.connection_callback('disconnected', peer_username)
+                    elif self.message_callback:
                         self.message_callback(f"System: {peer_username} disconnected", "system")
                     break
                 
+            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                # Connection lost
+                if self.connection_callback:
+                    self.connection_callback('disconnected', peer_username)
+                elif self.message_callback:
+                    self.message_callback(f"System: Connection lost with {peer_username}", "system")
+                break
             except Exception as e:
                 print(f"✗ Error receiving from {peer_username}: {e}")
+                if self.connection_callback:
+                    self.connection_callback('disconnected', peer_username)
+                elif self.message_callback:
+                    self.message_callback(f"System: Error receiving from {peer_username}: {str(e)}", "system")
                 break
         
         # Clean up connection
@@ -326,18 +380,30 @@ class Peer:
     
     def disconnect_from_peer(self, peer_username):
         """Disconnect from a specific peer"""
+        if peer_username not in self.connections:
+            # Already disconnected, just notify
+            if self.connection_callback:
+                self.connection_callback('disconnected', peer_username)
+            return
+        
+        try:
+            disconnect_msg = {
+                'type': MessageType.DISCONNECT.value,
+                'username': self.username,
+                'timestamp': datetime.now().isoformat()
+            }
+            self._send_message(self.connections[peer_username], disconnect_msg)
+            self.connections[peer_username].close()
+        except:
+            pass
+        
+        # Remove from connections
         if peer_username in self.connections:
-            try:
-                disconnect_msg = {
-                    'type': MessageType.DISCONNECT.value,
-                    'username': self.username,
-                    'timestamp': datetime.now().isoformat()
-                }
-                self._send_message(self.connections[peer_username], disconnect_msg)
-                self.connections[peer_username].close()
-            except:
-                pass
             del self.connections[peer_username]
+        
+        # Notify about disconnection
+        if self.connection_callback:
+            self.connection_callback('disconnected', peer_username)
     
     def stop(self):
         """Stop the peer and close all connections"""

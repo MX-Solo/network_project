@@ -124,8 +124,17 @@ class PeerChatGUI:
         connected_frame = ttk.LabelFrame(main_frame, text="Connected Peers", padding="10")
         connected_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(10, 0))
         
-        self.connected_listbox = tk.Listbox(connected_frame, height=3)
+        self.connected_listbox = tk.Listbox(connected_frame, height=3, selectmode=tk.SINGLE)
         self.connected_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Bind click event to ensure selection is maintained
+        def on_listbox_click(event):
+            # Ensure selection is visible
+            selection = self.connected_listbox.curselection()
+            if selection:
+                self.connected_listbox.see(selection[0])
+        
+        self.connected_listbox.bind('<Button-1>', on_listbox_click)
         
         disconnect_button = ttk.Button(connected_frame, text="Disconnect Selected", command=self.disconnect_selected)
         disconnect_button.pack(side=tk.LEFT, padx=5)
@@ -175,6 +184,7 @@ class PeerChatGUI:
                 self.peer = Peer(self.username, self.stun_server_url, self.tcp_port)
                 self.peer.set_message_callback(self.on_message_received)
                 self.peer.set_file_callback(self.on_file_event)
+                self.peer.set_connection_callback(self.on_connection_event)
                 
                 if self.peer.start_server():
                     self.status_label.config(text=f"Status: Connected as {self.username}", foreground="green")
@@ -184,15 +194,61 @@ class PeerChatGUI:
                     self.port_entry.config(state=tk.DISABLED)
                     self.add_chat_message("System", f"Logged in as {self.username}")
                     self.refresh_peers()
+                    # Start keepalive to prevent timeout (register every 20 seconds)
+                    self.start_keepalive(local_ip)
                 else:
                     messagebox.showerror("Error", "Failed to start TCP server")
             else:
                 messagebox.showerror("Error", f"Registration failed: {response.json().get('error', 'Unknown error')}")
+        except requests.exceptions.ConnectionError:
+            messagebox.showerror(
+                "Connection Error",
+                "Cannot connect to STUN Server!\n\n"
+                "Please make sure:\n"
+                "1. Redis is running (docker run -d -p 6379:6379 redis:7-alpine)\n"
+                "2. STUN Server is running (python stun_server.py)\n\n"
+                "See START_HERE.md for detailed instructions."
+            )
         except requests.exceptions.RequestException as e:
             messagebox.showerror("Error", f"Failed to connect to STUN server: {str(e)}")
     
+    def start_keepalive(self, local_ip):
+        """Start periodic re-registration to prevent timeout"""
+        if not self.username:
+            return
+        
+        self.keepalive_running = True
+        
+        def keepalive():
+            if not self.keepalive_running or not self.username:
+                return
+            
+            try:
+                response = requests.post(
+                    f"{self.stun_server_url}/register",
+                    json={
+                        "username": self.username,
+                        "ip": local_ip,
+                        "port": self.tcp_port
+                    },
+                    timeout=3
+                )
+                if response.status_code != 200:
+                    print(f"Keepalive failed: {response.json().get('error', 'Unknown')}")
+            except Exception as e:
+                print(f"Keepalive error: {e}")
+            
+            # Schedule next keepalive (every 20 seconds to stay ahead of 30s timeout)
+            if self.keepalive_running:
+                self.root.after(20000, keepalive)
+        
+        # Start first keepalive after 20 seconds
+        self.root.after(20000, keepalive)
+    
     def logout(self):
         """Logout and stop peer"""
+        self.keepalive_running = False
+        
         if self.peer:
             self.peer.stop()
             self.peer = None
@@ -225,8 +281,14 @@ class PeerChatGUI:
                 self.peers_listbox.delete(0, tk.END)
                 for peer in peers:
                     self.peers_listbox.insert(tk.END, f"{peer['username']} ({peer['ip']}:{peer['port']})")
+        except requests.exceptions.ConnectionError:
+            # Silently ignore connection errors when STUN server is not running
+            # User will see error when trying to login
+            pass
         except Exception as e:
-            print(f"Error refreshing peers: {e}")
+            # Only print other errors
+            if self.username:  # Only show errors if logged in
+                print(f"Error refreshing peers: {e}")
     
     def refresh_peers_loop(self):
         """Auto-refresh peers list every 5 seconds"""
@@ -263,8 +325,23 @@ class PeerChatGUI:
         # Connect in a separate thread
         def connect_thread():
             if self.peer.connect_to_peer(ip, port, username):
-                self.connected_peers[username] = {'ip': ip, 'port': port}
-                self.root.after(0, lambda: self.connected_listbox.insert(tk.END, username))
+                # Connection will be added via connection_callback
+                # But we also add it here for immediate feedback
+                if username not in self.connected_peers:
+                    self.connected_peers[username] = {'ip': ip, 'port': port}
+                    def add_and_select():
+                        items = list(self.connected_listbox.get(0, tk.END))
+                        if username not in items:
+                            idx = self.connected_listbox.size()
+                            self.connected_listbox.insert(tk.END, username)
+                            # Auto-select if it's the first/only peer
+                            if idx == 0:
+                                self.connected_listbox.selection_set(0)
+                            # Connection message will be shown by connection_callback
+                    self.root.after(0, add_and_select)
+            else:
+                # Connection failed
+                self.root.after(0, lambda: self.add_chat_message("System", f"✗ Failed to connect to {username}"))
         
         threading.Thread(target=connect_thread, daemon=True).start()
     
@@ -280,15 +357,44 @@ class PeerChatGUI:
         
         # Get selected connected peer
         selection = self.connected_listbox.curselection()
+        items = list(self.connected_listbox.get(0, tk.END))
+        
         if not selection:
-            messagebox.showwarning("Warning", "Please select a connected peer")
+            # Check if there are any connected peers
+            if not items:
+                messagebox.showwarning("Warning", "No connected peers. Please connect to a peer first from 'Online Peers' list.")
+                return
+            
+            # If only one peer is connected, auto-select it
+            if len(items) == 1:
+                self.connected_listbox.selection_set(0)
+                selection = (0,)
+            else:
+                messagebox.showwarning("Warning", "Please select a peer from the 'Connected Peers' list below by clicking on it.")
+                return
+        
+        if not selection:
             return
         
         peer_username = self.connected_listbox.get(selection[0])
         
+        # Verify peer is actually connected
+        if peer_username not in self.peer.connections:
+            messagebox.showwarning("Warning", f"Not connected to {peer_username}. The connection may have been lost.")
+            # Clean up
+            items = list(self.connected_listbox.get(0, tk.END))
+            if peer_username in items:
+                idx = items.index(peer_username)
+                self.connected_listbox.delete(idx)
+            if peer_username in self.connected_peers:
+                del self.connected_peers[peer_username]
+            return
+        
         if self.peer.send_message(peer_username, message):
             self.add_chat_message(f"You → {peer_username}", message)
             self.message_entry.delete(0, tk.END)
+        else:
+            messagebox.showerror("Error", f"Failed to send message to {peer_username}")
     
     def send_file(self):
         """Send a file to selected peer"""
@@ -320,13 +426,78 @@ class PeerChatGUI:
             return
         
         peer_username = self.connected_listbox.get(selection[0])
+        
+        # Disconnect (connection_callback will handle UI update)
         self.peer.disconnect_from_peer(peer_username)
         
+        # Also update UI directly for immediate feedback
         if peer_username in self.connected_peers:
             del self.connected_peers[peer_username]
         
-        self.connected_listbox.delete(selection[0])
-        self.add_chat_message("System", f"Disconnected from {peer_username}")
+        try:
+            self.connected_listbox.delete(selection[0])
+        except:
+            # If deletion fails, try to find and remove by value
+            items = list(self.connected_listbox.get(0, tk.END))
+            if peer_username in items:
+                idx = items.index(peer_username)
+                self.connected_listbox.delete(idx)
+        
+        self.add_chat_message("System", f"✗ Disconnected from {peer_username}")
+    
+    def on_connection_event(self, event_type, peer_username):
+        """Callback for connection events (connect/disconnect)"""
+        if event_type == 'connected':
+            # Add to connected list if not already there
+            is_new_connection = peer_username not in self.connected_peers
+            
+            if is_new_connection:
+                # Try to get peer info from STUN server
+                try:
+                    response = requests.get(
+                        f"{self.stun_server_url}/peerinfo?username={peer_username}",
+                        timeout=2
+                    )
+                    if response.status_code == 200:
+                        peer_info = response.json().get('peer', {})
+                        self.connected_peers[peer_username] = {
+                            'ip': peer_info.get('ip'),
+                            'port': peer_info.get('port')
+                        }
+                except:
+                    # If we can't get info, just add with empty info
+                    self.connected_peers[peer_username] = {'ip': '', 'port': 0}
+            
+            # Add to listbox if not already there
+            def add_to_listbox():
+                items = list(self.connected_listbox.get(0, tk.END))
+                if peer_username not in items:
+                    idx = self.connected_listbox.size()
+                    self.connected_listbox.insert(tk.END, peer_username)
+                    # Auto-select if it's the first/only peer
+                    if idx == 0:
+                        self.connected_listbox.selection_set(0)
+                    # Show connection message
+                    if is_new_connection:
+                        self.add_chat_message("System", f"✓ Connected to {peer_username}")
+            
+            self.root.after(0, add_to_listbox)
+        
+        elif event_type == 'disconnected':
+            # Remove from connected list
+            if peer_username in self.connected_peers:
+                del self.connected_peers[peer_username]
+            
+            # Remove from listbox and show message
+            def remove_from_listbox():
+                items = list(self.connected_listbox.get(0, tk.END))
+                if peer_username in items:
+                    idx = items.index(peer_username)
+                    self.connected_listbox.delete(idx)
+                # Show disconnection message
+                self.add_chat_message("System", f"✗ Disconnected from {peer_username}")
+            
+            self.root.after(0, remove_from_listbox)
     
     def on_message_received(self, content, sender):
         """Callback for received messages"""
